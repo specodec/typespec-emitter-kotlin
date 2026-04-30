@@ -10,10 +10,16 @@ import {
   Program,
   Type,
   Scalar,
+  Diagnostic,
 } from "@typespec/compiler";
+import {
+  checkReservedKeyword,
+  formatReservedError,
+} from "@specodec/typespec-specodec-core";
 
 export type EmitterOptions = {
   "emitter-output-dir": string;
+  "ignore-reserved-keywords"?: boolean;
 };
 
 interface FieldInfo {
@@ -100,21 +106,25 @@ function defaultValue(type: Type): string {
       case "boolean": return "false";
       case "int8": case "int16": case "int32": case "integer": return "0";
       case "int64": return "0L";
-      case "uint8": case "uint16": case "uint32": return "0";
-      case "uint64": return "0L";
+      case "uint8": case "uint16": case "uint32": return "0u";
+      case "uint64": return "0uL";
       case "float32": return "0f";
       case "float64": case "float": case "decimal": return "0.0";
       case "bytes": return "byteArrayOf()";
     }
   }
-  return "null!!";
+  return "null";
+}
+
+function isModelType(type: Type): boolean {
+  return type.kind === "Model";
 }
 
 function writeJsonExpr(expr: string, type: Type, w: string): string {
   if (isArrayType(type)) {
     const elem = arrayElementType(type);
     return [
-      `${w}.beginArray(${expr}.size)`,
+      `${w}.beginArray()`,
       `for (_e in ${expr}) { ${w}.nextElement(); ${writeJsonExpr("_e", elem, w)} }`,
       `${w}.endArray()`,
     ].join("\n        ");
@@ -124,16 +134,21 @@ function writeJsonExpr(expr: string, type: Type, w: string): string {
     switch (sn) {
       case "string": return `${w}.writeString(${expr})`;
       case "boolean": return `${w}.writeBool(${expr})`;
-      case "int8": case "int16": case "int32": case "integer": return `${w}.writeInt32(${expr}.toInt())`;
+      case "int8": case "int16": return `${w}.writeInt32(${expr}.toInt())`;
+      case "int32": case "integer": return `${w}.writeInt32(${expr})`;
       case "int64": return `${w}.writeInt64(${expr})`;
-      case "uint8": case "uint16": case "uint32": return `${w}.writeUint32(${expr}.toLong())`;
-      case "uint64": return `${w}.writeUint64(${expr}.toLong())`;
+      case "uint8": case "uint16": return `${w}.writeUint32(${expr}.toUInt())`;
+      case "uint32": return `${w}.writeUint32(${expr})`;
+      case "uint64": return `${w}.writeUint64(${expr})`;
       case "float32": return `${w}.writeFloat32(${expr})`;
       case "float64": case "float": case "decimal": return `${w}.writeFloat64(${expr})`;
       case "bytes": return `${w}.writeBytes(${expr})`;
     }
   }
-  return `// TODO: nested model`;
+  if (type.kind === "Model" && (type as Model).name) {
+    return `_writeJson${(type as Model).name}(${w}, ${expr})`;
+  }
+  return `// TODO: unknown type`;
 }
 
 function writeMsgPackExpr(expr: string, type: Type, w: string): string {
@@ -150,16 +165,21 @@ function writeMsgPackExpr(expr: string, type: Type, w: string): string {
     switch (sn) {
       case "string": return `${w}.writeString(${expr})`;
       case "boolean": return `${w}.writeBool(${expr})`;
-      case "int8": case "int16": case "int32": case "integer": return `${w}.writeInt32(${expr}.toInt())`;
+      case "int8": case "int16": return `${w}.writeInt32(${expr}.toInt())`;
+      case "int32": case "integer": return `${w}.writeInt32(${expr})`;
       case "int64": return `${w}.writeInt64(${expr})`;
-      case "uint8": case "uint16": case "uint32": return `${w}.writeUint32(${expr}.toLong())`;
-      case "uint64": return `${w}.writeUint64(${expr}.toLong())`;
+      case "uint8": case "uint16": return `${w}.writeUint32(${expr}.toUInt())`;
+      case "uint32": return `${w}.writeUint32(${expr})`;
+      case "uint64": return `${w}.writeUint64(${expr})`;
       case "float32": return `${w}.writeFloat32(${expr})`;
       case "float64": case "float": case "decimal": return `${w}.writeFloat64(${expr})`;
       case "bytes": return `${w}.writeBytes(${expr})`;
     }
   }
-  return `// TODO: nested model`;
+  if (type.kind === "Model" && (type as Model).name) {
+    return `_writeMsgPack${(type as Model).name}(${w}, ${expr})`;
+  }
+  return `// TODO: unknown type`;
 }
 
 function readExpr(type: Type, r: string): string {
@@ -173,9 +193,13 @@ function readExpr(type: Type, r: string): string {
     switch (sn) {
       case "string": return `${r}.readString()`;
       case "boolean": return `${r}.readBool()`;
-      case "int8": case "int16": case "int32": case "integer": return `${r}.readInt32()`;
+      case "int8": return `${r}.readInt32().toByte()`;
+      case "int16": return `${r}.readInt32().toShort()`;
+      case "int32": case "integer": return `${r}.readInt32()`;
       case "int64": return `${r}.readInt64()`;
-      case "uint8": case "uint16": case "uint32": return `${r}.readUint32()`;
+      case "uint8": return `${r}.readUint32().toUByte()`;
+      case "uint16": return `${r}.readUint32().toUShort()`;
+      case "uint32": return `${r}.readUint32()`;
       case "uint64": return `${r}.readUint64()`;
       case "float32": return `${r}.readFloat32()`;
       case "float64": case "float": case "decimal": return `${r}.readFloat64()`;
@@ -193,60 +217,81 @@ function generateModelCode(m: Model, pkg: string): string {
   const fields = extractFields(m);
   const lines: string[] = [];
 
-  lines.push(`data class ${m.name}(`);
-  for (const f of fields) {
-    const kt = typeToKotlin(f.type);
-    if (f.optional) {
-      lines.push(`    val ${f.name}: ${kt}? = null,`);
-    } else {
-      lines.push(`    val ${f.name}: ${kt},`);
+  if (fields.length === 0) {
+    lines.push(`class ${m.name}`);
+  } else {
+    lines.push(`data class ${m.name}(`);
+    for (const f of fields) {
+      const kt = typeToKotlin(f.type);
+      if (f.optional) {
+        lines.push(`    val ${f.name}: ${kt}? = null,`);
+      } else {
+        lines.push(`    val ${f.name}: ${kt},`);
+      }
     }
+    lines.push(`)`);
   }
-  lines.push(`)`);
-  lines.push(``);
 
   const requiredFields = fields.filter(f => !f.optional);
   const optionalFields = fields.filter(f => f.optional);
+
+  // Generate _writeJson helper
+  lines.push(``);
+  lines.push(`private fun _writeJson${m.name}(w: JsonWriter, obj: ${m.name}) {`);
+  lines.push(`    w.beginObject()`);
+  for (const f of fields) {
+    if (f.optional) {
+      lines.push(`    if (obj.${f.name} != null) { w.writeField("${f.name}"); ${writeJsonExpr(`obj.${f.name}`, f.type, "w")} }`);
+    } else {
+      lines.push(`    w.writeField("${f.name}"); ${writeJsonExpr(`obj.${f.name}`, f.type, "w")}`);
+    }
+  }
+  lines.push(`    w.endObject()`);
+  lines.push(`}`);
+
+  // Generate _writeMsgPack helper
+  lines.push(``);
+  lines.push(`private fun _writeMsgPack${m.name}(w: MsgPackWriter, obj: ${m.name}) {`);
+  if (optionalFields.length > 0) {
+    lines.push(`    var _n = ${requiredFields.length}`);
+    for (const f of optionalFields) {
+      lines.push(`    if (obj.${f.name} != null) _n++`);
+    }
+    lines.push(`    w.beginObject(_n)`);
+  } else {
+    lines.push(`    w.beginObject(${fields.length})`);
+  }
+  for (const f of fields) {
+    if (f.optional) {
+      lines.push(`    if (obj.${f.name} != null) { w.writeField("${f.name}"); ${writeMsgPackExpr(`obj.${f.name}`, f.type, "w")} }`);
+    } else {
+      lines.push(`    w.writeField("${f.name}"); ${writeMsgPackExpr(`obj.${f.name}`, f.type, "w")}`);
+    }
+  }
+  lines.push(`    w.endObject()`);
+  lines.push(`}`);
+
+  lines.push(``);
 
   lines.push(`val ${m.name}Codec: SpecCodec<${m.name}> = SpecCodec(`);
 
   lines.push(`    encodeJson = { obj ->`);
   lines.push(`        val w = JsonWriter()`);
-  lines.push(`        w.beginObject()`);
-  for (const f of requiredFields) {
-    lines.push(`        w.writeField("${f.name}"); ${writeJsonExpr(`obj.${f.name}`, f.type, "w")}`);
-  }
-  for (const f of optionalFields) {
-    lines.push(`        if (obj.${f.name} != null) { w.writeField("${f.name}"); ${writeJsonExpr(`obj.${f.name}`, f.type, "w")} }`);
-  }
-  lines.push(`        w.endObject()`);
+  lines.push(`        _writeJson${m.name}(w, obj)`);
   lines.push(`        w.toBytes()`);
   lines.push(`    },`);
 
   lines.push(`    encodeMsgPack = { obj ->`);
-  if (optionalFields.length > 0) {
-    lines.push(`        var _n = ${requiredFields.length}`);
-    for (const f of optionalFields) {
-      lines.push(`        if (obj.${f.name} != null) _n++`);
-    }
-  } else {
-    lines.push(`        val _n = ${requiredFields.length}`);
-  }
   lines.push(`        val w = MsgPackWriter()`);
-  lines.push(`        w.beginObject(_n)`);
-  for (const f of requiredFields) {
-    lines.push(`        w.writeField("${f.name}"); ${writeMsgPackExpr(`obj.${f.name}`, f.type, "w")}`);
-  }
-  for (const f of optionalFields) {
-    lines.push(`        if (obj.${f.name} != null) { w.writeField("${f.name}"); ${writeMsgPackExpr(`obj.${f.name}`, f.type, "w")} }`);
-  }
-  lines.push(`        w.endObject()`);
+  lines.push(`        _writeMsgPack${m.name}(w, obj)`);
   lines.push(`        w.toBytes()`);
   lines.push(`    },`);
 
   lines.push(`    decode = { r ->`);
   for (const f of fields) {
     if (f.optional) {
+      lines.push(`        var _${f.name}: ${typeToKotlin(f.type)}? = null`);
+    } else if (isModelType(f.type)) {
       lines.push(`        var _${f.name}: ${typeToKotlin(f.type)}? = null`);
     } else {
       lines.push(`        var _${f.name}: ${typeToKotlin(f.type)} = ${defaultValue(f.type)}`);
@@ -262,7 +307,10 @@ function generateModelCode(m: Model, pkg: string): string {
   lines.push(`            }`);
   lines.push(`        }`);
   lines.push(`        r.endObject()`);
-  const ctorArgs = fields.map(f => `${f.name} = _${f.name}`).join(", ");
+  const ctorArgs = fields.map(f => {
+    if (!f.optional && isModelType(f.type)) return `${f.name} = _${f.name}!!`;
+    return `${f.name} = _${f.name}`;
+  }).join(", ");
   lines.push(`        ${m.name}(${ctorArgs})`);
   lines.push(`    }`);
   lines.push(`)`);
@@ -273,17 +321,23 @@ function generateModelCode(m: Model, pkg: string): string {
 function collectServices(program: Program): ServiceInfo[] {
   const services = listServices(program);
   const result: ServiceInfo[] = [];
-  function collectFromNs(ns: Namespace) {
-    for (const [, iface] of ns.interfaces) {
-      const nsFQN = getNamespaceFullName(ns);
-      const models: Model[] = [];
-      const seen = new Set<string>();
-      navigateTypesInNamespace(ns, {
-        model: (m: Model) => {
-          if (m.name && !seen.has(m.name)) { models.push(m); seen.add(m.name); }
-        }
+  function collectFromNs(ns: Namespace, iface?: Interface) {
+    const nsFQN = getNamespaceFullName(ns);
+    const models: Model[] = [];
+    const seen = new Set<string>();
+    navigateTypesInNamespace(ns, {
+      model: (m: Model) => {
+        if (m.name && !seen.has(m.name)) { models.push(m); seen.add(m.name); }
+      }
+    });
+    if (models.length > 0) {
+      result.push({ 
+        namespace: ns, 
+        iface: iface || { name: ns.name || "TestService", namespace: ns } as Interface, 
+        serviceName: iface?.name || ns.name || "TestService", 
+        serviceFQN: iface ? `${nsFQN}.${iface.name}` : nsFQN || "TestService", 
+        models 
       });
-      result.push({ namespace: ns, iface, serviceName: iface.name, serviceFQN: `${nsFQN}.${iface.name}`, models });
     }
   }
   for (const svc of services) collectFromNs(svc.type);
@@ -298,7 +352,40 @@ function collectServices(program: Program): ServiceInfo[] {
 export async function $onEmit(context: EmitContext<EmitterOptions>) {
   const program = context.program;
   const outputDir = context.emitterOutputDir;
+  const ignoreReservedKeywords = context.options["ignore-reserved-keywords"] ?? false;
   const services = collectServices(program);
+
+  const reservedFieldErrors: Diagnostic[] = [];
+  for (const svc of services) {
+    for (const m of svc.models) {
+      if (!m.name) continue;
+      for (const [fieldName, prop] of m.properties) {
+        const reservedIn = checkReservedKeyword(fieldName);
+        if (reservedIn.length > 0) {
+          const message = formatReservedError(fieldName, m.name, reservedIn);
+          const diag: Diagnostic = {
+            severity: "error",
+            code: "reserved-keyword",
+            message,
+            target: prop,
+          };
+          reservedFieldErrors.push(diag);
+        }
+      }
+    }
+  }
+
+  if (reservedFieldErrors.length > 0 && !ignoreReservedKeywords) {
+    program.reportDiagnostics(reservedFieldErrors);
+    return;
+  }
+
+  if (reservedFieldErrors.length > 0 && ignoreReservedKeywords) {
+    for (const diag of reservedFieldErrors) {
+      console.warn(`Warning: ${diag.message}`);
+    }
+  }
+
   for (const svc of services) {
     const toSnake = (s: string) => s.replace(/([A-Z])/g, (m, c, i) => (i ? "_" : "") + c.toLowerCase());
     const pkg = svc.namespace.name?.toLowerCase().replace(/[^a-z0-9]/g, "") ?? "svc";
