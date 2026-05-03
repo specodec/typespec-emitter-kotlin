@@ -2,7 +2,6 @@ import {
   EmitContext,
   emitFile,
   listServices,
-  getNamespaceFullName,
   navigateTypesInNamespace,
   Model,
   Namespace,
@@ -15,7 +14,8 @@ import {
 import {
   checkReservedKeyword,
   formatReservedError,
-} from "@specodec/typespec-specodec-core";
+  isSpecodecModel,
+} from "@specodec/typespec-emitter-core";
 
 export type EmitterOptions = {
   "emitter-output-dir": string;
@@ -32,7 +32,6 @@ interface ServiceInfo {
   namespace: Namespace;
   iface: Interface;
   serviceName: string;
-  serviceFQN: string;
   models: Model[];
 }
 
@@ -294,27 +293,17 @@ function generateModelCode(m: Model, pkg: string): string {
   return lines.join("\n");
 }
 
-function isStdLibNamespace(ns: Namespace): boolean {
-  const fullName = getNamespaceFullName(ns);
-  return fullName === "TypeSpec" || fullName.startsWith("TypeSpec.");
-}
-
 function collectServices(program: Program): ServiceInfo[] {
   const services = listServices(program);
   const result: ServiceInfo[] = [];
   function collectFromNs(ns: Namespace, iface?: Interface) {
-    if (isStdLibNamespace(ns)) return;
-    const nsFQN = getNamespaceFullName(ns);
     const models: Model[] = [];
     const seen = new Set<string>();
     navigateTypesInNamespace(ns, {
       model: (m: Model) => {
-        if (m.name && !seen.has(m.name)) {
-          const modelNs = m.namespace;
-          if (modelNs && !isStdLibNamespace(modelNs)) {
-            models.push(m);
-            seen.add(m.name);
-          }
+        if (m.name && !seen.has(m.name) && isSpecodecModel(program, m)) {
+          models.push(m);
+          seen.add(m.name);
         }
       }
     });
@@ -323,7 +312,6 @@ function collectServices(program: Program): ServiceInfo[] {
         namespace: ns, 
         iface: iface || { name: ns.name || "TestService", namespace: ns } as Interface, 
         serviceName: iface?.name || ns.name || "TestService", 
-        serviceFQN: iface ? `${nsFQN}.${iface.name}` : nsFQN || "TestService", 
         models 
       });
     }
@@ -341,6 +329,7 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
   const program = context.program;
   const outputDir = context.emitterOutputDir;
   const ignoreReservedKeywords = context.options["ignore-reserved-keywords"] ?? false;
+
   const services = collectServices(program);
 
   const reservedFieldErrors: Diagnostic[] = [];
