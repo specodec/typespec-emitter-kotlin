@@ -73,7 +73,7 @@ function writeExpr(expr: string, type: Type, w: string): string {
     const elem = arrayElementType(type);
     return [
       `${w}.beginArray(${expr}.size)`,
-      `for (_e in ${expr}) { ${w}.nextElement(); ${writeExpr("_e", elem, w)} }`,
+      `for (item in ${expr}) { ${w}.nextElement(); ${writeExpr("item", elem, w)} }`,
       `${w}.endArray()`,
     ].join("\n        ");
   }
@@ -81,7 +81,7 @@ function writeExpr(expr: string, type: Type, w: string): string {
     const elem = recordElementType(type);
     return [
       `${w}.beginObject(${expr}.size)`,
-      `for ((_k, _v) in ${expr}) { ${w}.writeField(_k); ${writeExpr("_v", elem, w)} }`,
+      `for ((key, val) in ${expr}) { ${w}.writeField(key); ${writeExpr("val", elem, w)} }`,
       `${w}.endObject()`,
     ].join("\n        ");
   }
@@ -101,7 +101,7 @@ function writeExpr(expr: string, type: Type, w: string): string {
       case "bytes": return `${w}.writeBytes(${expr})`;
     }
   }
-  if (type.kind === "Model" && (type as Model).name) return `_write${(type as Model).name}(${w}, ${expr})`;
+  if (type.kind === "Model" && (type as Model).name) return `write${(type as Model).name}(w, ${expr})`;
   return `// TODO: unknown type`;
 }
 
@@ -109,12 +109,12 @@ function readExpr(type: Type, r: string, optional?: boolean): string {
   if (isArrayType(type)) {
     const elem = arrayElementType(type);
     const ktElem = typeToKotlin(elem);
-    return `run { val _list = mutableListOf<${ktElem}>(); ${r}.beginArray(); while (${r}.hasNextElement()) { _list.add(${readExpr(elem, r)}) }; ${r}.endArray(); _list }`;
+    return `run { val list = mutableListOf<${ktElem}>(); ${r}.beginArray(); while (${r}.hasNextElement()) { list.add(${readExpr(elem, r)}) }; ${r}.endArray(); list }`;
   }
   if (isRecordType(type)) {
     const elem = recordElementType(type);
     const ktElem = typeToKotlin(elem);
-    return `run { val _map = mutableMapOf<String, ${ktElem}>(); ${r}.beginObject(); while (${r}.hasNextField()) { val _k = ${r}.readFieldName(); _map[_k] = ${readExpr(elem, r)} }; ${r}.endObject(); _map }`;
+    return `run { val map = mutableMapOf<String, ${ktElem}>(); ${r}.beginObject(); while (${r}.hasNextField()) { val key = ${r}.readFieldName(); map[key] = ${readExpr(elem, r)} }; ${r}.endObject(); map }`;
   }
   const n = scalarName(type);
   if (n) {
@@ -163,11 +163,11 @@ function generateModelCode(m: Model, pkg: string): string {
   }
 
   lines.push(``);
-  lines.push(`private fun _write${m.name}(w: SpecWriter, obj: ${m.name}) {`);
+  lines.push(`private fun write${m.name}(w: SpecWriter, obj: ${m.name}) {`);
   if (optionalFields.length > 0) {
-    lines.push(`    var _n = ${requiredFields.length}`);
-    for (const f of optionalFields) lines.push(`    if (obj.${f.name} != null) _n++`);
-    lines.push(`    w.beginObject(_n)`);
+    lines.push(`    var fieldCount = ${requiredFields.length}`);
+    for (const f of optionalFields) lines.push(`    if (obj.${f.name} != null) fieldCount++`);
+    lines.push(`    w.beginObject(fieldCount)`);
   } else {
     lines.push(`    w.beginObject(${fields.length})`);
   }
@@ -183,26 +183,26 @@ function generateModelCode(m: Model, pkg: string): string {
 
   lines.push(``);
   lines.push(`val ${m.name}Codec: SpecCodec<${m.name}> = SpecCodec(`);
-  lines.push(`    encode = { w, obj -> _write${m.name}(w, obj) },`);
+  lines.push(`    encode = { w, obj -> write${m.name}(w, obj) },`);
   lines.push(`    decode = { r ->`);
   for (const f of fields) {
     if (f.optional || isModelType(f.type)) {
-      lines.push(`        var _${f.name}: ${typeToKotlin(f.type)}? = null`);
+      lines.push(`        var ${f.name}Val: ${typeToKotlin(f.type)}? = null`);
     } else {
-      lines.push(`        var _${f.name}: ${typeToKotlin(f.type)} = ${defaultValue(f.type)}`);
+      lines.push(`        var ${f.name}Val: ${typeToKotlin(f.type)} = ${defaultValue(f.type)}`);
     }
   }
   lines.push(`        r.beginObject()`);
   lines.push(`        while (r.hasNextField()) {`);
   lines.push(`            when (r.readFieldName()) {`);
   for (const f of fields) {
-    lines.push(`                "${f.name}" -> _${f.name} = ${readExpr(f.type, "r", f.optional)}`);
+    lines.push(`                "${f.name}" -> ${f.name}Val = ${readExpr(f.type, "r", f.optional)}`);
   }
   lines.push(`                else -> r.skip()`);
   lines.push(`            }`);
   lines.push(`        }`);
   lines.push(`        r.endObject()`);
-  const ctorArgs = fields.map(f => (!f.optional && isModelType(f.type)) ? `${f.name} = _${f.name}!!` : `${f.name} = _${f.name}`).join(", ");
+  const ctorArgs = fields.map(f => (!f.optional && isModelType(f.type)) ? `${f.name} = ${f.name}Val!!` : `${f.name} = ${f.name}Val`).join(", ");
   lines.push(`        ${m.name}(${ctorArgs})`);
   lines.push(`    }`);
   lines.push(`)`);
