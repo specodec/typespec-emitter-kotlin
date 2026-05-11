@@ -328,7 +328,7 @@ function generateUnionCode(u: UnionInfo, L: string[]): void {
   L.push(`    r.beginObject()`);
   L.push(`    if (!r.hasNextField()) { r.endObject(); throw IllegalArgumentException("empty union") }`);
   L.push(`    val field = r.readFieldName()`);
-  L.push(`    val result: ${unionName} = ${unionName}.${unionName}Undefined`);
+  L.push(`    var result: ${unionName} = ${unionName}.${unionName}Undefined`);
   L.push(`    when (field) {`);
   for (const v of u.variants) {
     const vn = variantName(v);
